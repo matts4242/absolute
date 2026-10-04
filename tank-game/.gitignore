@@ -1,1 +1,4 @@
-tank
+build*/
+out/
+.vs/
+*.exe
