@@ -1,0 +1,35 @@
+name: Steel Curtain (Windows build)
+
+on:
+  push:
+    paths:
+      - "tank-game/**"
+      - ".github/workflows/tank-game-windows.yml"
+  workflow_dispatch:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure (Visual Studio, x64)
+        run: cmake -S tank-game -B tank-game/build -A x64
+
+      - name: Build
+        run: cmake --build tank-game/build --config Release
+
+      - name: Smoke test (headless battle simulation)
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath tank-game/build/Release/steel_curtain.exe -ArgumentList "--simulate","3","1" -NoNewWindow -Wait -PassThru -RedirectStandardOutput sim.txt
+          Get-Content sim.txt
+          if ($p.ExitCode -ne 0) { exit $p.ExitCode }
+
+      - name: Upload game
+        uses: actions/upload-artifact@v4
+        with:
+          name: SteelCurtain-windows
+          path: |
+            tank-game/build/Release/steel_curtain.exe
+            tank-game/README.md
