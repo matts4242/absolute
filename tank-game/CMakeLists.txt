@@ -6,6 +6,9 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
   set(CMAKE_BUILD_TYPE Release)
 endif()
+# Visual Studio: link the C++ runtime statically (game and raylib alike) so the .exe runs on
+# PCs without the Visual C++ Redistributable installed.
+set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
 # raylib is downloaded automatically. To build offline, point CMake at a local copy:
 #   cmake -B build -DFETCHCONTENT_SOURCE_DIR_RAYLIB=/path/to/raylib
