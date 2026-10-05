@@ -53,7 +53,8 @@ class Terrain {
   // Terrain-only line of sight: hills, woods and towns block.
   bool lineOfSight(Vector2 a, Vector2 b) const;
 
-  std::vector<Vector2> findPath(Vector2 from, Vector2 to, const VehicleType& vt) const;
+  // roadBias > 1 makes roads more attractive (quick moves stick to them).
+  std::vector<Vector2> findPath(Vector2 from, Vector2 to, const VehicleType& vt, float roadBias = 1.0f) const;
 
   const std::vector<Town>& towns() const { return towns_; }
   const std::vector<int>& northRoads() const { return northRoads_; }
@@ -66,7 +67,8 @@ class Terrain {
  private:
   Tile& mut(int tx, int ty) { return tiles_[ty * kCols + tx]; }
   void placeTown(int cx, int cy, float radius, const std::string& name, bool objective);
-  bool segmentClear(Vector2 a, Vector2 b, const VehicleType& vt, float minFactor) const;
+  bool segmentClear(Vector2 a, Vector2 b, const VehicleType& vt, float minFactor, float roadBias) const;
+  float biasedFactor(const Tile& t, const VehicleType& vt, float roadBias) const;
 
   std::vector<Tile> tiles_ = std::vector<Tile>(kCols * kRows);
   std::vector<Town> towns_;

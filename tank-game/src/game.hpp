@@ -10,6 +10,15 @@
 
 enum class SoundKind { Cannon, Autocannon, Missile, Explosion, Artillery };
 
+// How a unit moves. Faster modes trade accuracy and concealment for speed.
+enum class MoveMode { Hold, Move, Quick, Deliberate, Assault };
+// Formation kept by a group moving together under one order.
+enum class Formation { None, Column, Line, Wedge, EchelonLeft, EchelonRight };
+
+const char* moveModeName(MoveMode m);
+const char* formationName(Formation f);
+Color moveModeColor(MoveMode m);
+
 struct SoundEvent {
   SoundKind kind;
   Vector2 pos;
@@ -27,6 +36,15 @@ struct Unit {
   float turret = 0;   // absolute turret angle
   float speed = 0;
   std::vector<Vector2> path;
+  std::vector<int> pathLeg;  // formation leg of each waypoint (empty when moving alone)
+
+  MoveMode mode = MoveMode::Hold;
+  int formation = -1;        // index into Game::formations, -1 when not in one
+  int legsDone = 0;          // formation legs completed (members wait for each other)
+  Vector2 assaultPoint{};    // where an assault is aimed
+  float assaultTimer = 0;
+  float waitTime = 0;        // time spent waiting for formation members
+  bool orderPending = false; // an order is on its way down the chain of command
 
   bool alive = true;
   bool damaged = false;
@@ -48,7 +66,7 @@ struct Unit {
   int kills = 0;
   uint32_t camo = 0;
 
-  float aiHalt = 0, aiMove = 0;  // Soviet fire-and-movement timers
+  float haltTimer = 0, boundTimer = 0;  // short halts to shoot during fire and movement
   float stillTime = 0;           // seconds since the vehicle last moved (hull-down bonus)
 
   const VehicleType& vt() const { return vehicleType(type); }
@@ -120,6 +138,21 @@ struct Message {
   double time;
 };
 
+struct Order {
+  MoveMode mode = MoveMode::Move;
+  Formation formation = Formation::None;
+  Vector2 dest{};
+  float facing = 0;
+  std::vector<int> units;
+  std::vector<Vector2> slots;  // destination of each unit, same order as units
+  float delay = 0;             // seconds of battle time until the units act on it
+};
+
+struct FormationGroup {
+  std::vector<int> members;
+  float speedCap = 0;  // the group moves at the pace of its slowest vehicle
+};
+
 struct SpawnOrder {
   float time;
   int type;
@@ -127,19 +160,26 @@ struct SpawnOrder {
   int road;
 };
 
-enum class Phase { Deploy, Battle, Over };
+// Deploy: free set-up. Orders: clock frozen, both sides plan. Battle: the turn executes.
+enum class Phase { Deploy, Orders, Battle, Over };
 enum class Outcome { None, DecisiveVictory, MarginalVictory, Draw, MarginalDefeat, DecisiveDefeat };
 
 class Game {
  public:
   void start(int difficulty, uint32_t seed);
-  void beginBattle();
+  void beginBattle();   // Deploy -> first orders phase
+  void executeTurn();   // Orders -> Battle for one turn
   void update(float dt);
 
-  // Player orders.
-  void orderMove(const std::vector<int>& ids, Vector2 dest);
+  // Player orders. Movement orders are queued in the orders phase and reach the units
+  // after a command delay once the turn executes; during deployment they act at once.
+  bool issueOrder(const std::vector<int>& ids, Vector2 dest, MoveMode mode, Formation formation);
   void orderTarget(const std::vector<int>& ids, int enemy);
   void orderStop(const std::vector<int>& ids);
+  // Where each unit would end up for a given order (used for the on-map preview).
+  std::vector<Vector2> formationSlots(const std::vector<int>& ids, Vector2 dest, Formation f, float* facing) const;
+  const Order* pendingOrderFor(int unit) const;
+  bool canIssueOrders() const { return phase == Phase::Deploy || phase == Phase::Orders; }
   void toggleHoldFire(const std::vector<int>& ids);
   void popSmoke(const std::vector<int>& ids);
   bool callArtillery(Vector2 target, bool smoke);
@@ -161,10 +201,15 @@ class Game {
   std::vector<SoundEvent> sounds;
   std::vector<Message> messages;
   std::vector<SpawnOrder> spawnQueue;
+  std::vector<Order> pendingOrders;
+  std::vector<FormationGroup> formations;
 
   Phase phase = Phase::Deploy;
   Outcome outcome = Outcome::None;
   int difficulty = 1;
+  int turn = 0;
+  float turnLength = 60;    // battle seconds per turn
+  float turnClock = 0;      // seconds into the current turn
   float clock = 0;          // battle time in seconds
   float duration = 720;     // 12 minutes
   double elapsed = 0;       // wall time including deployment, for message fading
@@ -207,6 +252,11 @@ class Game {
   void shellImpact(Vector2 p, bool smoke);
   void deploySmoke(Unit& u);
   void sendToObjective(Unit& u, int objective);
+  void applyOrder(const Order& o);
+  void cancelPending(int unit);
+  void leaveFormation(Unit& u);
+  void updateAssault(Unit& u, float dt);
+  std::vector<Vector2> formationOffsets(const std::vector<int>& ids, Vector2 dest, Formation f, float* facing) const;
 
   void log(const std::string& text, Color color);
   void sound(SoundKind k, Vector2 p);

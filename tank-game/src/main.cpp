@@ -56,6 +56,20 @@ void panel(Rectangle r, unsigned char alpha = 225) {
   DrawRectangleRec(r, {16, 20, 18, alpha});
   DrawRectangleLinesEx(r, 1.0f, {120, 130, 110, 160});
 }
+void dashedLine(Vector2 a, Vector2 b, float thick, float dash, Color c) {
+  float len = Vector2Distance(a, b);
+  if (len < 1) return;
+  Vector2 dir = (b - a) / len;
+  for (float t = 0; t < len; t += dash * 2) {
+    DrawLineEx(a + dir * t, a + dir * std::min(len, t + dash), thick, c);
+  }
+}
+void arrow(Vector2 at, float angle, float len, float thick, Color c) {
+  Vector2 tip = at + fromAngle(angle, len);
+  DrawLineEx(at, tip, thick, c);
+  DrawLineEx(tip, tip + fromAngle(angle + 2.6f, len * 0.35f), thick, c);
+  DrawLineEx(tip, tip + fromAngle(angle - 2.6f, len * 0.35f), thick, c);
+}
 std::string clockText(float seconds) {
   int s = static_cast<int>(seconds);
   return fmt("%02d:%02d", s / 60, s % 60);
@@ -82,6 +96,36 @@ struct App {
   uint32_t seed = 1;
   float accumulator = 0;
   float guideTime = 0;
+  MoveMode orderMode = MoveMode::Move;
+  Formation formation = Formation::None;
+
+  static constexpr MoveMode kOrderModes[] = {MoveMode::Move, MoveMode::Quick, MoveMode::Deliberate, MoveMode::Assault};
+  static constexpr Formation kFormations[] = {Formation::None, Formation::Column, Formation::Line,
+                                              Formation::Wedge, Formation::EchelonLeft, Formation::EchelonRight};
+  static constexpr const char* kOrderKeys[] = {"Move", "Quick", "Deliberate", "Assault"};
+  static constexpr const char* kFormationKeys[] = {"None", "Column", "Line", "Wedge", "Ech. L", "Ech. R"};
+
+  Rectangle orderButton(int i) const { return {96.0f + i * 112.0f, 44, 106, 26}; }
+  Rectangle formationButton(int i) const { return {96.0f + i * 82.0f, 76, 76, 26}; }
+  Rectangle executeButton() const {
+    return {static_cast<float>(GetScreenWidth()) - 250, static_cast<float>(GetScreenHeight()) - 66, 240, 56};
+  }
+
+  // Modifier keys pick the order type for a single right-click.
+  MoveMode effectiveMode() const {
+    if (IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT)) return MoveMode::Quick;
+    if (IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL)) return MoveMode::Deliberate;
+    if (IsKeyDown(KEY_LEFT_ALT) || IsKeyDown(KEY_RIGHT_ALT)) return MoveMode::Assault;
+    return orderMode;
+  }
+
+  void advance() {  // the Enter key / Execute button
+    if (game.phase == Phase::Deploy) game.beginBattle();
+    else if (game.phase == Phase::Orders) {
+      game.executeTurn();
+      paused = false;
+    }
+  }
 
   void newMap() {
     seed = static_cast<uint32_t>(std::chrono::steady_clock::now().time_since_epoch().count());
@@ -168,6 +212,8 @@ struct App {
     if (m.y < 36) return true;
     if (CheckCollisionPointRec(m, selectionPanelRect())) return true;
     if (CheckCollisionPointRec(m, rosterRect())) return true;
+    if (CheckCollisionPointRec(m, executeButton())) return true;
+    if (m.x < 96 + 6 * 82 && m.y < 106) return true;  // order and formation toolbar
     return false;
   }
 
@@ -199,9 +245,20 @@ struct App {
       if (IsKeyPressed(KEY_ESCAPE)) screen = Screen::Title;
       return;
     }
-    if (IsKeyPressed(KEY_SPACE)) paused = !paused;
+    if (IsKeyPressed(KEY_SPACE) && game.phase == Phase::Battle) paused = !paused;
     if (IsKeyPressed(KEY_F)) timeScale = timeScale == 1 ? 2 : timeScale == 2 ? 4 : 1;
-    if (IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_KP_ENTER)) game.beginBattle();
+    if (IsKeyPressed(KEY_T)) game.turnLength = game.turnLength >= 90 ? 30 : game.turnLength + 30;
+    if (IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_KP_ENTER)) advance();
+    if (IsKeyPressed(KEY_TAB)) {
+      int i = 0;
+      while (kOrderModes[i] != orderMode) ++i;
+      orderMode = kOrderModes[(i + 1) % 4];
+    }
+    if (IsKeyPressed(KEY_O)) {
+      int i = 0;
+      while (kFormations[i] != formation) ++i;
+      formation = kFormations[(i + 1) % 6];
+    }
     if (IsKeyPressed(KEY_ESCAPE)) {
       if (mode != Mode::Normal) mode = Mode::Normal;
       else if (showHelp) showHelp = false;
@@ -228,8 +285,18 @@ struct App {
     if (IsKeyPressed(KEY_Q)) mode = mode == Mode::ArtyHE ? Mode::Normal : Mode::ArtyHE;
     if (IsKeyPressed(KEY_R)) mode = mode == Mode::ArtySmoke ? Mode::Normal : Mode::ArtySmoke;
 
-    // Roster clicks.
+    // Toolbar and button clicks.
     Vector2 m = GetMousePosition();
+    if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+      for (int i = 0; i < 4; ++i) {
+        if (CheckCollisionPointRec(m, orderButton(i))) orderMode = kOrderModes[i];
+      }
+      for (int i = 0; i < 6; ++i) {
+        if (CheckCollisionPointRec(m, formationButton(i))) formation = kFormations[i];
+      }
+      if (CheckCollisionPointRec(m, executeButton())) advance();
+    }
+    // Roster clicks.
     if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && CheckCollisionPointRec(m, rosterRect())) {
       int row = static_cast<int>((m.y - rosterRect().y - 30) / 40);
       int n = 0;
@@ -291,12 +358,19 @@ struct App {
 
     if (IsMouseButtonPressed(MOUSE_BUTTON_RIGHT) && !selection.empty()) {
       int enemy = unitAt(w, false);
-      if (enemy >= 0) game.orderTarget(selection, enemy);
-      else game.orderMove(selection, w);
+      if (enemy >= 0) {
+        game.orderTarget(selection, enemy);
+      } else if (!game.issueOrder(selection, w, effectiveMode(), formation)) {
+        game.messages.push_back({"Orders can only be given in the orders phase.", {255, 200, 120, 255}, game.elapsed});
+      }
     }
   }
 
   void stepSimulation(float frameDt) {
+    if (game.phase == Phase::Orders) {
+      game.update(0.0f);  // clock frozen while planning
+      return;
+    }
     if (paused) return;
     if (game.phase == Phase::Over) {  // let fires and smoke keep drifting behind the results
       game.update(std::min(frameDt, 0.1f));
@@ -353,16 +427,53 @@ struct App {
       drawVehicle(u.vt(), u.pos, u.heading, u.turret + 0.4f, drawScale(), u.camo, true);
     }
 
-    // Orders for the selection.
+    // Orders being carried out by the selection, coloured by order type.
     for (int id : selection) {
       const Unit& u = game.units[id];
+      Color c = moveModeColor(u.mode);
+      c.a = 160;
       Vector2 prev = u.pos;
       for (const Vector2& p : u.path) {
-        DrawLineEx(prev, p, 1.5f * px, {150, 220, 255, 150});
+        DrawLineEx(prev, p, 1.5f * px, c);
         prev = p;
       }
-      if (!u.path.empty()) DrawCircleV(u.path.back(), 3.5f * px, {150, 220, 255, 200});
+      if (!u.path.empty()) DrawCircleV(u.path.back(), 3.5f * px, c);
       if (u.target >= 0) DrawLineEx(u.pos, game.units[u.target].pos, 1.2f * px, {255, 90, 70, 120});
+    }
+
+    // Orders still on their way down the chain of command: dashed lines to each unit's slot.
+    for (const Order& o : game.pendingOrders) {
+      Color c = moveModeColor(o.mode);
+      for (size_t i = 0; i < o.units.size(); ++i) {
+        const Unit& u = game.units[o.units[i]];
+        if (!u.alive) continue;
+        if (o.mode == MoveMode::Hold) {
+          DrawRing(u.pos, 14 * px, 16.5f * px, 0, 360, 24, c);
+          continue;
+        }
+        dashedLine(u.pos, o.slots[i], 1.8f * px, 10 * px, {c.r, c.g, c.b, 210});
+        DrawRing(o.slots[i], 5 * px, 7 * px, 0, 360, 20, c);
+      }
+      if (o.mode != MoveMode::Hold && o.formation != Formation::None) arrow(o.dest, o.facing, 40 * px, 2 * px, c);
+    }
+
+    // Preview of the order a right-click would give.
+    if (game.canIssueOrders() && !selection.empty() && mode == Mode::Normal && !mouseOverUi()) {
+      Vector2 w = mouseWorld();
+      if (unitAt(w, false) < 0) {
+        MoveMode m = effectiveMode();
+        Formation f = selection.size() > 1 ? formation : Formation::None;
+        float facing = 0;
+        std::vector<Vector2> slots = game.formationSlots(selection, w, f, &facing);
+        Color c = moveModeColor(m);
+        for (size_t i = 0; i < slots.size(); ++i) {
+          DrawRing(slots[i], 6 * px, 8 * px, 0, 360, 20, {c.r, c.g, c.b, 150});
+          if (f != Formation::None && i + 1 < slots.size()) {
+            DrawLineEx(slots[i], slots[i + 1], 1.0f * px, {c.r, c.g, c.b, 60});
+          }
+        }
+        if (f != Formation::None) arrow(w, facing, 34 * px, 1.6f * px, {c.r, c.g, c.b, 170});
+      }
     }
 
     if (showRanges && selection.size() == 1) {
@@ -447,6 +558,14 @@ struct App {
       Color c = o.owner == Side::NATO ? Color{150, 200, 255, 255} : Color{255, 140, 120, 255};
       textCentered(fmt("OBJ %c  %s", 'A' + static_cast<int>(i), o.name.c_str()), p.x, p.y - 20, 18, c);
     }
+    for (const Order& o : game.pendingOrders) {
+      if (o.mode == MoveMode::Hold || o.units.empty()) continue;
+      Vector2 p = GetWorldToScreen2D(o.dest, cam);
+      std::string label = moveModeName(o.mode);
+      if (o.formation != Formation::None) label += std::string(" - ") + formationName(o.formation);
+      label += fmt("  (in %ds)", static_cast<int>(std::ceil(o.delay)));
+      textCentered(label, p.x, p.y + 14, 13, moveModeColor(o.mode));
+    }
     if (cam.zoom > 0.9f && !showCounters) {
       for (const Unit& u : game.units) {
         if (!u.alive || u.side != Side::NATO) continue;
@@ -479,12 +598,23 @@ struct App {
     text("Fulda Gap, 1985", 190, 13, 14, {170, 170, 150, 255});
 
     std::string status;
-    if (game.phase == Phase::Deploy) status = "DEPLOYMENT  -  press ENTER to start the battle";
-    else if (game.phase == Phase::Battle) status = fmt("H+%s / %s   x%d", clockText(game.clock).c_str(), clockText(game.duration).c_str(), timeScale);
-    else status = "BATTLE OVER";
-    if (paused && game.phase != Phase::Over) status += "   [PAUSED]";
-    textCentered(status, sw / 2, 9, 20, game.phase == Phase::Deploy ? Color{255, 220, 120, 255} : RAYWHITE);
-
+    Color statusColor = RAYWHITE;
+    switch (game.phase) {
+      case Phase::Deploy:
+        status = "DEPLOYMENT  -  set up freely, then ENTER";
+        statusColor = {255, 220, 120, 255};
+        break;
+      case Phase::Orders:
+        status = fmt("TURN %d  -  ORDERS PHASE  -  H+%s", game.turn, clockText(game.clock).c_str());
+        statusColor = {255, 220, 120, 255};
+        break;
+      case Phase::Battle:
+        status = fmt("TURN %d  -  EXECUTING %s/%s  -  H+%s  x%d", game.turn, clockText(game.turnClock).c_str(),
+                     clockText(game.turnLength).c_str(), clockText(game.clock).c_str(), timeScale);
+        if (paused) status += "   [PAUSED]";
+        break;
+      case Phase::Over: status = "BATTLE OVER"; break;
+    }
     float x = sw - 12;
     std::string arty = fmt("Arty  HE %d  Smoke %d%s", game.artyHE, game.artySmoke, game.artyBusy ? " (firing)" : "");
     x -= textWidth(arty, 16);
@@ -499,20 +629,73 @@ struct App {
       text(std::string(1, static_cast<char>('A' + i)), x + 7, 11, 16, RAYWHITE);
     }
 
+    // Centre the status between the title and the right-hand readouts, shrinking it if needed.
+    const float left = 300, right = x - 16;
+    float size = 20;
+    while (size > 13 && textWidth(status, size) > right - left) size -= 1;
+    float cx = std::clamp(sw / 2, left + textWidth(status, size) / 2, right - textWidth(status, size) / 2);
+    textCentered(status, cx, 18 - size / 2, size, statusColor);
+
     if (mode != Mode::Normal) {
       std::string m = mode == Mode::ArtyHE ? "Left-click to call a 155mm HE fire mission  (right-click to cancel)"
                                            : "Left-click to lay an artillery smoke screen  (right-click to cancel)";
-      if (game.phase != Phase::Battle) m = "Artillery is not available until the battle starts";
+      if (game.phase != Phase::Orders) m = "Fire missions are planned in the orders phase";
       else if (game.artyBusy) m = "The battery is still firing the last mission";
       else if ((mode == Mode::ArtyHE ? game.artyHE : game.artySmoke) <= 0) m = "No fire missions of that type left";
       textCentered(m, sw / 2, 46, 18, {255, 200, 140, 255});
     }
 
+    drawToolbar();
+    drawExecuteButton();
     drawRoster();
     drawSelectionPanel();
     drawMessages(sh);
     if (showHelp) drawHelp();
     if (game.phase == Phase::Over) drawResults();
+  }
+
+  void drawToolbar() {
+    const bool active = game.canIssueOrders();
+    DrawRectangle(0, 38, 96 + 6 * 82 + 4, 70, {12, 16, 14, 190});
+    text("ORDER", 12, 50, 15, {230, 220, 180, 255});
+    text("FORMATION", 12, 82, 13, {230, 220, 180, 255});
+    Vector2 m = GetMousePosition();
+    for (int i = 0; i < 4; ++i) {
+      Rectangle r = orderButton(i);
+      bool on = kOrderModes[i] == effectiveMode();
+      Color c = moveModeColor(kOrderModes[i]);
+      DrawRectangleRec(r, on ? Color{c.r, c.g, c.b, 90} : Color{30, 36, 32, 230});
+      DrawRectangleLinesEx(r, on ? 2.0f : 1.0f, CheckCollisionPointRec(m, r) ? WHITE : Color{c.r, c.g, c.b, 200});
+      textCentered(kOrderKeys[i], r.x + r.width / 2, r.y + 5, 16, active ? RAYWHITE : Color{150, 150, 150, 255});
+    }
+    for (int i = 0; i < 6; ++i) {
+      Rectangle r = formationButton(i);
+      bool on = kFormations[i] == formation;
+      DrawRectangleRec(r, on ? Color{200, 190, 140, 90} : Color{30, 36, 32, 230});
+      DrawRectangleLinesEx(r, on ? 2.0f : 1.0f, CheckCollisionPointRec(m, r) ? WHITE : Color{200, 190, 140, 200});
+      textCentered(kFormationKeys[i], r.x + r.width / 2, r.y + 6, 14, RAYWHITE);
+    }
+  }
+
+  void drawExecuteButton() {
+    if (game.phase == Phase::Over) return;
+    Rectangle r = executeButton();
+    Vector2 m = GetMousePosition();
+    bool hover = CheckCollisionPointRec(m, r);
+    if (game.phase == Phase::Battle) {
+      panel(r);
+      float f = std::clamp(game.turnClock / game.turnLength, 0.0f, 1.0f);
+      DrawRectangle(static_cast<int>(r.x + 8), static_cast<int>(r.y + 36), static_cast<int>((r.width - 16) * f), 10, {120, 190, 255, 220});
+      textCentered(fmt("Turn %d executing", game.turn), r.x + r.width / 2, r.y + 8, 18, RAYWHITE);
+      return;
+    }
+    Color base = game.phase == Phase::Deploy ? Color{150, 120, 40, 255} : Color{60, 120, 60, 255};
+    DrawRectangleRec(r, hover ? shadeColor(base, 30) : base);
+    DrawRectangleLinesEx(r, 2, {230, 220, 180, 255});
+    std::string label = game.phase == Phase::Deploy ? "BEGIN BATTLE" : fmt("EXECUTE TURN %d", game.turn);
+    textCentered(label, r.x + r.width / 2, r.y + 8, 22, RAYWHITE);
+    textCentered(fmt("Enter    turn length %d s (T)", static_cast<int>(game.turnLength)), r.x + r.width / 2, r.y + 34, 13,
+                 {230, 230, 210, 255});
   }
 
   void drawRoster() {
@@ -553,9 +736,12 @@ struct App {
     panel(r);
     if (selection.empty()) {
       text("No units selected", r.x + 12, r.y + 12, 18, {230, 220, 180, 255});
-      const char* hints[] = {"Left-click or drag: select units", "Double-click: select the whole platoon",
-                             "Right-click: move, or attack a spotted enemy", "Q: artillery HE   R: artillery smoke",
-                             "Space: pause    F: game speed", "C: NATO symbols    WASD / wheel: camera"};
+      const char* hints[] = {"Left-click or drag: select units  (dbl-click: platoon)",
+                             "Right-click: order the selected type of move",
+                             "  Shift: quick   Ctrl: deliberate   Alt: assault",
+                             "Tab: order type   O: formation   X: halt",
+                             "Enter: execute the turn   Q/R: artillery",
+                             "C: NATO symbols    WASD / wheel: camera"};
       for (int i = 0; i < 6; ++i) text(hints[i], r.x + 12, r.y + 46 + i * 24, 15, {200, 200, 190, 255});
       return;
     }
@@ -564,8 +750,8 @@ struct App {
       float y = r.y + 42;
       for (size_t i = 0; i < selection.size() && i < 7; ++i) {
         const Unit& u = game.units[selection[i]];
-        text(fmt("%-12s %s%s", u.callsign.c_str(), u.vt().name, u.damaged ? "  (damaged)" : ""), r.x + 12, y, 14,
-             RAYWHITE);
+        text(fmt("%-12s %-16s %s%s", u.callsign.c_str(), u.vt().name, moveModeName(u.mode), u.damaged ? " (dmg)" : ""),
+             r.x + 12, y, 14, RAYWHITE);
         y += 22;
       }
       if (selection.size() > 7) text(fmt("... and %zu more", selection.size() - 7), r.x + 12, y, 14, {170, 170, 160, 255});
@@ -583,7 +769,11 @@ struct App {
     if (u.suppression > 70) state += ", PINNED";
     else if (u.suppression > 35) state += ", suppressed";
     text(state, r.x + 116, r.y + 72, 14, u.damaged ? Color{255, 160, 90, 255} : Color{120, 230, 130, 255});
-    std::string orders = u.guiding >= 0 ? "Guiding missile" : !u.path.empty() ? "Moving" : "Holding";
+    std::string orders = u.guiding >= 0 ? "Guiding missile" : moveModeName(u.mode);
+    if (u.formation >= 0 && !u.path.empty()) orders += " (formation)";
+    if (const Order* po = game.pendingOrderFor(u.id)) {
+      orders += fmt(" -> %s in %ds", moveModeName(po->mode), static_cast<int>(std::ceil(po->delay)));
+    }
     if (u.holdFire) orders += "  (HOLD FIRE)";
     text(orders + fmt("  %d km/h", static_cast<int>(u.speed * kKmhPerSpeed)), r.x + 116, r.y + 90, 14, RAYWHITE);
 
@@ -624,20 +814,25 @@ struct App {
 
   void drawHelp() {
     float sw = static_cast<float>(GetScreenWidth()), sh = static_cast<float>(GetScreenHeight());
-    Rectangle r{sw / 2 - 330, sh / 2 - 250, 660, 500};
+    Rectangle r{sw / 2 - 340, sh / 2 - 300, 680, 600};
     panel(r, 235);
     textCentered("FIELD MANUAL", sw / 2, r.y + 16, 24, {230, 220, 180, 255});
     const char* lines[] = {
+        "Each turn: plan in the ORDERS PHASE, then press Enter to EXECUTE it.",
+        "Orders reach units after a few seconds' command delay.",
         "Left-click / drag        Select units (Shift adds, double-click = platoon)",
-        "Right-click              Move (formation kept) / attack a spotted enemy",
-        "1 - 6, E                 Select a platoon / everything",
-        "H  X  Z                  Hold fire toggle / stop / pop smoke grenades",
-        "Q  R                     Call 155mm HE / smoke fire mission",
-        "Space  F                 Pause / game speed x1, x2, x4",
+        "Right-click              Order a move / make a spotted enemy the target",
+        "Tab, or Shift/Ctrl/Alt   Move, Quick, Deliberate, Assault (or toolbar)",
+        "O                        Formation: column, line, wedge, echelon L/R",
+        "1 - 6, E  H  X  Z        Platoon / all; hold fire; halt; smoke grenades",
+        "Q  R  T                  155mm HE / smoke mission; turn length",
+        "Space  F                 Pause / speed during execution",
         "WASD, arrows, wheel      Pan and zoom; middle-drag pans; Home fits map",
         "C  G  L                  NATO symbols / km grid / range rings",
         "V  F1  Esc               Vehicle guide / this help / cancel",
         "",
+        "Quick: fast, prefers roads, shoots badly, easy to see. Deliberate: slow,",
+        "halts to shoot, sees further. Assault: presses on under fire and closes in.",
         "Hold the three bridgehead towns (OBJ A-C) until the clock runs out.",
         "Units only see what is in line of sight: hills, woods and towns block it,",
         "and so does smoke. Woods and towns also make units harder to hit.",
@@ -796,6 +991,7 @@ int runSimulation(int count, int difficulty) {
     g.start(difficulty, 1000u + static_cast<uint32_t>(i));
     g.beginBattle();
     while (g.phase != Phase::Over) {
+      if (g.phase == Phase::Orders) g.executeTurn();
       g.update(kStep);
       g.particles.clear();
       g.sounds.clear();
@@ -849,7 +1045,10 @@ int main(int argc, char** argv) {
     float seconds = captureMode.size() > 7 ? static_cast<float>(std::atof(captureMode.c_str() + 7)) : 200.0f;
     app.screen = Screen::Playing;
     app.game.beginBattle();
-    while (app.game.clock < seconds && app.game.phase == Phase::Battle) app.game.update(kStep);
+    while (app.game.clock < seconds && app.game.phase != Phase::Over) {
+      if (app.game.phase == Phase::Orders) app.game.executeTurn();
+      app.game.update(kStep);
+    }
     // Centre on the NATO vehicle closest to an enemy so the screenshot shows the fighting.
     int focus = -1;
     float bestD = 1e9f;
@@ -868,6 +1067,27 @@ int main(int argc, char** argv) {
       app.cam.zoom = captureMode.find(":zoom") != std::string::npos ? 1.6f : app.cam.zoom;
     }
     app.showCounters = captureMode.find(":counters") != std::string::npos;
+  } else if (capturePath && captureMode == "orders") {
+    // Turn 3 orders phase with several orders queued and a formation preview under the mouse.
+    app.screen = Screen::Playing;
+    app.game.beginBattle();
+    while (app.game.turn < 3 && app.game.phase != Phase::Over) {
+      if (app.game.phase == Phase::Orders) app.game.executeTurn();
+      app.game.update(kStep);
+    }
+    const auto& pl = app.game.platoons;
+    Vector2 o1 = app.game.objectives[1].pos;
+    app.game.issueOrder(pl[1].units, o1 + Vector2{-120, -260}, MoveMode::Move, Formation::Wedge);
+    app.game.issueOrder(pl[3].units, app.game.objectives[2].pos + Vector2{-200, 160}, MoveMode::Quick, Formation::Column);
+    app.game.issueOrder(pl[2].units, app.game.objectives[0].pos + Vector2{60, -80}, MoveMode::Assault, Formation::Line);
+    app.selection.assign(pl[4].units.begin(), pl[4].units.end());
+    app.pruneSelection();
+    app.formation = Formation::Line;
+    app.orderMode = MoveMode::Deliberate;
+    app.cam.target = o1 + Vector2{0, 60};
+    app.cam.zoom = 0.85f;
+    app.cam.offset = {GetScreenWidth() / 2.0f, GetScreenHeight() / 2.0f};
+    SetMousePosition(static_cast<int>(GetScreenWidth() * 0.62f), static_cast<int>(GetScreenHeight() * 0.62f));
   } else if (capturePath && captureMode == "guide") {
     app.screen = Screen::Guide;
   }

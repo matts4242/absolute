@@ -41,6 +41,55 @@ float segmentPointDistance(Vector2 a, Vector2 b, Vector2 p) {
 
 }  // namespace
 
+const char* moveModeName(MoveMode m) {
+  switch (m) {
+    case MoveMode::Hold: return "Hold";
+    case MoveMode::Move: return "Move";
+    case MoveMode::Quick: return "Quick move";
+    case MoveMode::Deliberate: return "Deliberate move";
+    case MoveMode::Assault: return "Assault";
+  }
+  return "";
+}
+
+const char* formationName(Formation f) {
+  switch (f) {
+    case Formation::None: return "No formation";
+    case Formation::Column: return "Column";
+    case Formation::Line: return "Line";
+    case Formation::Wedge: return "Wedge";
+    case Formation::EchelonLeft: return "Echelon left";
+    case Formation::EchelonRight: return "Echelon right";
+  }
+  return "";
+}
+
+Color moveModeColor(MoveMode m) {
+  switch (m) {
+    case MoveMode::Hold: return {220, 220, 220, 255};
+    case MoveMode::Move: return {120, 190, 255, 255};
+    case MoveMode::Quick: return {90, 240, 240, 255};
+    case MoveMode::Deliberate: return {140, 240, 120, 255};
+    case MoveMode::Assault: return {255, 110, 80, 255};
+  }
+  return WHITE;
+}
+
+namespace {
+
+float modeSpeed(MoveMode m) {
+  switch (m) {
+    case MoveMode::Quick: return 1.3f;
+    case MoveMode::Deliberate: return 0.55f;
+    case MoveMode::Assault: return 0.9f;
+    default: return 1.0f;
+  }
+}
+
+float modeRoadBias(MoveMode m) { return m == MoveMode::Quick ? 2.0f : m == MoveMode::Deliberate ? 0.8f : 1.0f; }
+
+}  // namespace
+
 float SmokeCloud::currentRadius() const {
   float age = maxLife - life;
   float grow = std::min(1.0f, 0.35f + age / 4.0f);
@@ -80,8 +129,25 @@ void Game::start(int diff, uint32_t seed) {
 
 void Game::beginBattle() {
   if (phase != Phase::Deploy) return;
-  phase = Phase::Battle;
+  // Deployment moves are finished instantly so turn 1 starts from the chosen positions.
+  for (Unit& u : units) {
+    if (!u.path.empty()) u.pos = u.path.back();
+    u.path.clear();
+    u.pathLeg.clear();
+    u.speed = 0;
+    u.mode = MoveMode::Hold;
+    leaveFormation(u);
+  }
+  phase = Phase::Orders;
+  turn = 1;
   log("H-Hour. Soviet forces are crossing the inner German border.", {255, 180, 120, 255});
+  log("Turn 1 - orders phase. Give orders, then press ENTER to execute the turn.", RAYWHITE);
+}
+
+void Game::executeTurn() {
+  if (phase != Phase::Orders) return;
+  phase = Phase::Battle;
+  turnClock = 0;
 }
 
 Vector2 Game::findSpot(Vector2 near, const VehicleType& vt, float minSpacing) const {
@@ -202,10 +268,22 @@ void Game::update(float dt) {
   for (auto& s : smokes) s.life -= dt;
   smokes.erase(std::remove_if(smokes.begin(), smokes.end(), [](const SmokeCloud& s) { return s.life <= 0; }),
                smokes.end());
-  if (phase == Phase::Over) return;
+  if (phase == Phase::Over || phase == Phase::Orders) return;  // the clock is frozen while planning
 
   if (phase == Phase::Battle) {
     clock += dt;
+    turnClock += dt;
+    // Orders work their way down the chain of command before the units act on them.
+    for (Order& o : pendingOrders) o.delay -= dt;
+    for (size_t i = 0; i < pendingOrders.size();) {
+      if (pendingOrders[i].delay <= 0) {
+        Order o = pendingOrders[i];
+        pendingOrders.erase(pendingOrders.begin() + static_cast<long>(i));
+        applyOrder(o);
+      } else {
+        ++i;
+      }
+    }
     processSpawns();
     aiTimer_ -= dt;
     if (aiTimer_ <= 0) {
@@ -234,6 +312,13 @@ void Game::update(float dt) {
       updateObjectives();
     }
     checkEnd();
+    if (phase == Phase::Battle && turnClock >= turnLength) {
+      phase = Phase::Orders;
+      ++turn;
+      log("Turn " + std::to_string(turn) + " - orders phase (H+" + std::to_string(static_cast<int>(clock) / 60) + ":" +
+              (static_cast<int>(clock) % 60 < 10 ? "0" : "") + std::to_string(static_cast<int>(clock) % 60) + ").",
+          RAYWHITE);
+    }
   }
 }
 
@@ -265,7 +350,14 @@ void Game::sendToObjective(Unit& u, int objective) {
   const Objective& o = objectives[objective];
   Vector2 spot = o.pos + fromAngle(simRng().uniform(0, 2 * PI), simRng().uniform(0, o.radius * 0.7f));
   if (!terrain.passable(spot, u.vt())) spot = o.pos;
-  u.path = terrain.findPath(u.pos, spot, u.vt());
+  // Soviet SOP: scouts creep forward, everyone else races up the roads, then assaults.
+  const UnitClass cls = u.vt().cls;
+  float d = Vector2Distance(u.pos, o.pos);
+  if (cls == UnitClass::Recon || cls == UnitClass::AntiTank) u.mode = MoveMode::Deliberate;
+  else u.mode = d > 900.0f ? MoveMode::Quick : MoveMode::Assault;
+  u.assaultPoint = spot;
+  u.path = terrain.findPath(u.pos, spot, u.vt(), modeRoadBias(u.mode));
+  u.pathLeg.clear();
 }
 
 void Game::updateAi() {
@@ -306,7 +398,9 @@ void Game::updateAi() {
 
     const Objective& o = objectives[p.objective];
     for (Unit* u : alive) {
-      if (!u->path.empty()) continue;
+      // Shake out of the road march into the assault once close to the objective.
+      if (u->mode == MoveMode::Quick && Vector2Distance(u->pos, o.pos) < 900.0f) sendToObjective(*u, p.objective);
+      if (!u->path.empty() || u->mode == MoveMode::Assault) continue;
       if (Vector2Distance(u->pos, o.pos) > o.radius) {
         sendToObjective(*u, p.objective);
       } else if (o.owner != Side::WP && u->target < 0 && simRng().chance(0.15f)) {
@@ -358,14 +452,19 @@ void Game::updateSpotting() {
       e.spotted[si] = std::max(0.0f, e.spotted[si] - step);
       if (!e.alive) continue;
       float conceal = terrain.concealmentAt(e.pos) * e.vt().size;
-      if (e.speed > 2.0f) conceal *= 1.25f;
+      if (e.speed > 2.0f) {
+        // Quick moves kick up dust; deliberate moves creep from cover to cover.
+        conceal *= e.mode == MoveMode::Quick ? 1.5f : e.mode == MoveMode::Deliberate ? 1.0f : 1.25f;
+      }
       if (e.firedRecently > 0) conceal *= 1.8f;
       conceal = std::min(conceal, 1.6f);
       bool seen = false;
       for (const Unit& f : units) {
         if (!f.alive || f.side != spotter) continue;
         float d = Vector2Distance(f.pos, e.pos);
-        if (d > f.vt().optics * conceal) continue;
+        float optics = f.vt().optics * (f.mode == MoveMode::Deliberate ? 1.2f : 1.0f);
+        if (f.mode == MoveMode::Quick && f.speed > 2.0f) optics *= 0.8f;  // eyes on the road
+        if (d > optics * conceal) continue;
         if (!hasLos(f.pos, e.pos)) continue;
         seen = true;
         break;
@@ -423,12 +522,28 @@ void Game::updateUnit(Unit& u, float dt) {
   u.gunCd -= dt;
   u.atgmCd -= dt;
   u.firedRecently -= dt;
-  u.aiHalt -= dt;
-  u.aiMove -= dt;
+  u.haltTimer -= dt;
+  u.boundTimer -= dt;
   u.suppression = std::max(0.0f, u.suppression - 7.0f * dt);
 
+  // Formation members wait at the end of each leg until the whole group has caught up.
+  bool waiting = false;
+  float speedCap = 1e9f;
+  if (u.formation >= 0 && !u.pathLeg.empty()) {
+    const FormationGroup& g = formations[u.formation];
+    int leg = u.pathLeg.front();
+    for (int m : g.members) {
+      const Unit& o = units[m];
+      if (o.alive && o.formation == u.formation && !o.pathLeg.empty() && o.legsDone < leg) waiting = true;
+    }
+    speedCap = g.speedCap;
+    // Don't wait forever for a vehicle that is stuck or pinned down.
+    u.waitTime = waiting ? u.waitTime + dt : 0.0f;
+    if (u.waitTime > 20.0f) waiting = false;
+  }
+
   // Movement along the path.
-  bool halted = u.guiding >= 0 || (u.side == Side::WP && u.aiHalt > 0);
+  bool halted = u.guiding >= 0 || u.haltTimer > 0 || waiting;
   float targetSpeed = 0;
   if (!u.path.empty() && !halted) {
     Vector2 wp = u.path.front();
@@ -436,13 +551,21 @@ void Game::updateUnit(Unit& u, float dt) {
     float arrive = u.path.size() == 1 ? 6.0f : 18.0f;
     if (d < arrive) {
       u.path.erase(u.path.begin());
+      if (!u.pathLeg.empty()) {
+        int leg = u.pathLeg.front();
+        u.pathLeg.erase(u.pathLeg.begin());
+        if (u.pathLeg.empty() || u.pathLeg.front() != leg) u.legsDone = leg + 1;
+      }
+      if (u.path.empty() && u.mode != MoveMode::Assault) u.mode = MoveMode::Hold;
     } else {
       float desired = angleTo(u.pos, wp);
       u.heading = turnTowards(u.heading, desired, vt.turnRate * dt);
       float err = fabsf(wrapAngle(desired - u.heading));
       float sf = terrain.speedFactorAt(u.pos, vt);
       if (sf <= 0) sf = 0.3f;
-      float maxSp = vt.speed * sf * (u.damaged ? 0.5f : 1.0f) * (u.suppression > 70 ? 0.4f : 1.0f);
+      const float pinnedAt = u.mode == MoveMode::Assault ? 90.0f : 70.0f;  // assaulting troops press on
+      float base = std::min(vt.speed, speedCap);
+      float maxSp = base * sf * modeSpeed(u.mode) * (u.damaged ? 0.5f : 1.0f) * (u.suppression > pinnedAt ? 0.4f : 1.0f);
       targetSpeed = err > 1.2f ? maxSp * 0.1f : maxSp * (1.0f - err / 1.5f);
       if (u.path.size() == 1) targetSpeed = std::min(targetSpeed, d * 0.8f + 2.0f);
     }
@@ -458,8 +581,34 @@ void Game::updateUnit(Unit& u, float dt) {
     else u.speed = 0;
   }
 
-  if (phase == Phase::Battle) updateCombat(u, dt);
-  else u.turret = turnTowards(u.turret, u.heading, vt.turretRate * dt);
+  if (phase == Phase::Battle) {
+    updateAssault(u, dt);
+    updateCombat(u, dt);
+  } else {
+    u.turret = turnTowards(u.turret, u.heading, vt.turretRate * dt);
+  }
+}
+
+// Once an assault reaches its objective, the unit closes with any enemy it can see nearby.
+void Game::updateAssault(Unit& u, float dt) {
+  if (u.mode != MoveMode::Assault || !u.path.empty()) return;
+  u.assaultTimer -= dt;
+  if (u.assaultTimer > 0) return;
+  u.assaultTimer = 2.0f;
+  const int si = sideIndex(u.side);
+  int best = -1;
+  float bestD = 1e9f;
+  for (const Unit& e : units) {
+    if (!e.alive || e.side == u.side || e.spotted[si] <= 0) continue;
+    if (Vector2Distance(e.pos, u.assaultPoint) > 300.0f) continue;
+    float d = Vector2Distance(u.pos, e.pos);
+    if (d < bestD) bestD = d, best = e.id;
+  }
+  if (best < 0) {
+    u.mode = MoveMode::Hold;  // position cleared
+    return;
+  }
+  if (bestD > 70.0f) u.path = terrain.findPath(u.pos, units[best].pos, u.vt());
 }
 
 void Game::separateUnits() {
@@ -552,6 +701,7 @@ float Game::hitChance(const Unit& u, const Weapon& w, const Unit& t, float dist)
     p *= std::sqrt(terrain.coverAt(t.pos));
   } else {
     if (u.speed > 2) {
+      if (u.mode == MoveMode::Quick) p *= 0.6f;  // firing on the run
       p *= w.stabilized ? 0.75f : 0.35f;
       if (u.side == Side::WP) p *= 0.7f;  // cruder Soviet fire control on the move
     }
@@ -560,7 +710,7 @@ float Game::hitChance(const Unit& u, const Weapon& w, const Unit& t, float dist)
   }
   if (t.stillTime > 10.0f) p *= 0.75f;  // settled hull-down in a firing position
   p *= 0.8f + 0.2f * t.vt().size;
-  p *= 1.0f - 0.5f * u.suppression / 100.0f;
+  p *= 1.0f - (u.mode == MoveMode::Assault ? 0.25f : 0.5f) * u.suppression / 100.0f;
   if (u.damaged) p *= 0.8f;
   return std::clamp(p, 0.03f, 0.97f);
 }
@@ -585,13 +735,16 @@ void Game::updateCombat(Unit& u, float dt) {
   float desired = angleTo(u.pos, t.pos);
   u.turret = turnTowards(u.turret, desired, vt.turretRate * dt);
 
-  // Soviet fire-and-movement: halt briefly to shoot, then press on.
-  if (u.side == Side::WP && u.aiHalt <= 0 && u.aiMove <= 0) {
+  // Fire and movement: a deliberate move (and Soviet doctrine, except when racing up a road
+  // or assaulting) halts briefly to shoot from a standstill, then presses on.
+  bool shortHalts = u.mode == MoveMode::Deliberate ||
+                    (u.side == Side::WP && u.mode != MoveMode::Quick && u.mode != MoveMode::Assault);
+  if (shortHalts && !u.path.empty() && u.haltTimer <= 0 && u.boundTimer <= 0) {
     bool inRange = (vt.gun.valid() && d <= vt.gun.range) || (vt.atgm.valid() && u.atgmAmmo > 0 && d <= vt.atgm.range);
     if (inRange) {
-      bool overwatch = vt.cls == UnitClass::AntiTank || vt.cls == UnitClass::Recon;
-      u.aiHalt = overwatch ? 9.0f : 4.0f;
-      u.aiMove = u.aiHalt + 5.0f;
+      bool overwatch = vt.cls == UnitClass::AntiTank || vt.cls == UnitClass::Recon || u.mode == MoveMode::Deliberate;
+      u.haltTimer = overwatch ? 9.0f : 4.0f;
+      u.boundTimer = u.haltTimer + 5.0f;
     }
   }
 
@@ -791,7 +944,7 @@ void Game::updateMissiles(float dt) {
 }
 
 bool Game::callArtillery(Vector2 target, bool smoke) {
-  if (phase != Phase::Battle || artyBusy) return false;
+  if (phase != Phase::Orders || artyBusy) return false;  // fire missions are planned between turns
   int& left = smoke ? artySmoke : artyHE;
   if (left <= 0) return false;
   --left;
@@ -924,27 +1077,210 @@ const char* Game::outcomeName() const {
 // Player orders
 // ---------------------------------------------------------------------------
 
-void Game::orderMove(const std::vector<int>& ids, Vector2 dest) {
-  // Keep the group's formation, compressed to at most 90 units from the centre.
+bool Game::issueOrder(const std::vector<int>& ids, Vector2 dest, MoveMode mode, Formation formation) {
+  if (!canIssueOrders()) return false;
+  std::vector<int> alive;
+  for (int id : ids) {
+    if (units[id].alive) alive.push_back(id);
+  }
+  if (alive.empty()) return false;
+  for (int id : alive) cancelPending(id);
+
+  Order o;
+  o.mode = mode;
+  o.formation = alive.size() > 1 ? formation : Formation::None;
+  o.dest = dest;
+  o.units = alive;
+  o.slots = formationSlots(alive, dest, o.formation, &o.facing);
+  if (phase == Phase::Deploy) {
+    applyOrder(o);
+    return true;
+  }
+  // Command delay: a few seconds for the order to be passed on, longer for a suppressed
+  // unit or for a whole group that has to coordinate a formation move.
+  float supp = 0;
+  for (int id : alive) supp += units[id].suppression;
+  supp /= static_cast<float>(alive.size());
+  o.delay = 2.0f + simRng().uniform(0.0f, 4.0f) + supp / 25.0f + (o.formation != Formation::None ? 2.0f : 0.0f);
+  for (int id : alive) units[id].orderPending = true;
+  pendingOrders.push_back(o);
+  return true;
+}
+
+const Order* Game::pendingOrderFor(int unit) const {
+  for (const Order& o : pendingOrders) {
+    if (std::find(o.units.begin(), o.units.end(), unit) != o.units.end()) return &o;
+  }
+  return nullptr;
+}
+
+void Game::cancelPending(int unit) {
+  for (Order& o : pendingOrders) {
+    for (size_t i = 0; i < o.units.size(); ++i) {
+      if (o.units[i] == unit) {
+        o.units.erase(o.units.begin() + static_cast<long>(i));
+        o.slots.erase(o.slots.begin() + static_cast<long>(i));
+        break;
+      }
+    }
+  }
+  pendingOrders.erase(std::remove_if(pendingOrders.begin(), pendingOrders.end(),
+                                     [](const Order& o) { return o.units.empty(); }),
+                      pendingOrders.end());
+  units[unit].orderPending = false;
+}
+
+void Game::leaveFormation(Unit& u) {
+  u.formation = -1;
+  u.pathLeg.clear();
+  u.legsDone = 0;
+  u.waitTime = 0;
+}
+
+std::vector<Vector2> Game::formationOffsets(const std::vector<int>& ids, Vector2 dest, Formation f,
+                                            float* facingOut) const {
+  std::vector<Vector2> offsets(ids.size(), Vector2{0, 0});  // (forward, right) from dest
+  std::vector<size_t> alive;
   Vector2 center{0, 0};
-  int n = 0;
-  for (int id : ids) {
-    if (units[id].alive) center += units[id].pos, ++n;
+  for (size_t i = 0; i < ids.size(); ++i) {
+    if (units[ids[i]].alive) alive.push_back(i), center += units[ids[i]].pos;
   }
-  if (n == 0) return;
-  center = center / static_cast<float>(n);
-  float maxLen = 0;
-  for (int id : ids) {
-    if (units[id].alive) maxLen = std::max(maxLen, Vector2Distance(units[id].pos, center));
+  if (alive.empty()) {
+    if (facingOut) *facingOut = 0;
+    return offsets;
   }
-  float scale = maxLen > 90 ? 90 / maxLen : 1.0f;
+  center = center / static_cast<float>(alive.size());
+  float facing = Vector2Distance(center, dest) > 1.0f ? angleTo(center, dest) : units[ids[alive[0]]].heading;
+  if (facingOut) *facingOut = facing;
+  const float c = cosf(facing), sn = sinf(facing);
+  auto toLocal = [&](Vector2 v) { return Vector2{v.x * c + v.y * sn, -v.x * sn + v.y * c}; };
+
+  if (f == Formation::None) {  // keep the current layout, compressed to 90 units from the centre
+    float maxLen = 0;
+    for (size_t i : alive) maxLen = std::max(maxLen, Vector2Distance(units[ids[i]].pos, center));
+    float scale = maxLen > 90 ? 90 / maxLen : 1.0f;
+    for (size_t i : alive) offsets[i] = toLocal((units[ids[i]].pos - center) * scale);
+    return offsets;
+  }
+
+  const int n = static_cast<int>(alive.size());
+  const float sp = 45.0f;  // 90 m between vehicles
+  std::vector<Vector2> slots(n);
+  for (int k = 0; k < n; ++k) {
+    switch (f) {
+      case Formation::Column: slots[k] = {-k * sp * 1.1f, 0}; break;
+      case Formation::Line: slots[k] = {0, (k - (n - 1) / 2.0f) * sp}; break;
+      case Formation::Wedge: {
+        int j = (k + 1) / 2;
+        slots[k] = {-j * sp * 0.8f, (k % 2 ? -1.0f : 1.0f) * j * sp};
+        break;
+      }
+      case Formation::EchelonLeft: slots[k] = {-k * sp * 0.7f, -k * sp * 0.7f}; break;
+      case Formation::EchelonRight: slots[k] = {-k * sp * 0.7f, k * sp * 0.7f}; break;
+      case Formation::None: break;
+    }
+  }
+  // Give each vehicle the slot on its own side of the group so paths don't cross.
+  auto key = [&](Vector2 local) {
+    return f == Formation::Column ? -local.x : local.y * 1000.0f - local.x;
+  };
+  std::vector<int> unitOrder(n), slotOrder(n);
+  for (int k = 0; k < n; ++k) unitOrder[k] = slotOrder[k] = k;
+  std::sort(unitOrder.begin(), unitOrder.end(), [&](int a, int b) {
+    return key(toLocal(units[ids[alive[a]]].pos - center)) < key(toLocal(units[ids[alive[b]]].pos - center));
+  });
+  std::sort(slotOrder.begin(), slotOrder.end(), [&](int a, int b) { return key(slots[a]) < key(slots[b]); });
+  for (int k = 0; k < n; ++k) offsets[alive[unitOrder[k]]] = slots[slotOrder[k]];
+  return offsets;
+}
+
+std::vector<Vector2> Game::formationSlots(const std::vector<int>& ids, Vector2 dest, Formation f,
+                                          float* facing) const {
+  float a = 0;
+  std::vector<Vector2> offs = formationOffsets(ids, dest, f, &a);
+  if (facing) *facing = a;
+  std::vector<Vector2> out;
+  for (const Vector2& o : offs) out.push_back(localPoint(dest, a, o.x, o.y));
+  return out;
+}
+
+void Game::applyOrder(const Order& o) {
+  std::vector<int> ids;
+  std::vector<Vector2> slots;
+  for (size_t i = 0; i < o.units.size(); ++i) {
+    if (units[o.units[i]].alive) ids.push_back(o.units[i]), slots.push_back(o.slots[i]);
+  }
+  if (ids.empty()) return;
+  const float bias = modeRoadBias(o.mode);
   for (int id : ids) {
     Unit& u = units[id];
-    if (!u.alive) continue;
-    Vector2 d = dest + (u.pos - center) * scale;
-    if (!terrain.passable(d, u.vt())) d = dest;
-    u.path = terrain.findPath(u.pos, d, u.vt());
-    if (u.path.empty()) log(u.callsign + " cannot reach that position.", {255, 200, 120, 255});
+    u.orderPending = false;
+    leaveFormation(u);
+    u.mode = o.mode;
+    u.haltTimer = u.boundTimer = 0;
+    if (o.mode == MoveMode::Hold) u.path.clear();
+  }
+  if (o.mode == MoveMode::Hold) return;
+
+  auto moveAlone = [&](size_t i) {
+    Unit& u = units[ids[i]];
+    Vector2 d = terrain.passable(slots[i], u.vt()) ? slots[i] : o.dest;
+    u.path = terrain.findPath(u.pos, d, u.vt(), bias);
+    u.assaultPoint = d;
+    if (u.path.empty()) {
+      u.mode = MoveMode::Hold;
+      if (u.side == Side::NATO) log(u.callsign + " cannot reach that position.", {255, 200, 120, 255});
+    }
+  };
+  if (o.formation == Formation::None || ids.size() == 1) {
+    for (size_t i = 0; i < ids.size(); ++i) moveAlone(i);
+    return;
+  }
+
+  // The route is planned for the least capable vehicle (one that can't swim, then the
+  // slowest); every member follows it, offset to its formation slot.
+  int lead = ids.front();
+  float speedCap = 1e9f;
+  for (int id : ids) {
+    const VehicleType& a = units[id].vt();
+    const VehicleType& b = units[lead].vt();
+    if ((!a.amphibious && b.amphibious) || (a.amphibious == b.amphibious && a.speed < b.speed)) lead = id;
+    speedCap = std::min(speedCap, a.speed);
+  }
+  const VehicleType& leadVt = units[lead].vt();
+  Vector2 center{0, 0};
+  for (int id : ids) center += units[id].pos;
+  center = center / static_cast<float>(ids.size());
+  if (!terrain.passable(center, leadVt)) center = units[lead].pos;
+  std::vector<Vector2> route = terrain.findPath(center, o.dest, leadVt, bias);
+  if (route.empty()) {
+    for (size_t i = 0; i < ids.size(); ++i) moveAlone(i);
+    return;
+  }
+  float finalFacing = 0;
+  std::vector<Vector2> offs = formationOffsets(ids, o.dest, o.formation, &finalFacing);
+
+  const int group = static_cast<int>(formations.size());
+  formations.push_back({ids, speedCap});
+  for (size_t i = 0; i < ids.size(); ++i) {
+    Unit& u = units[ids[i]];
+    const VehicleType& vt = u.vt();
+    Vector2 from = u.pos;
+    for (size_t j = 0; j < route.size(); ++j) {
+      Vector2 prev = j == 0 ? center : route[j - 1];
+      float h = j + 1 == route.size() ? finalFacing : angleTo(prev, route[j]);
+      Vector2 t = localPoint(route[j], h, offs[i].x, offs[i].y);
+      if (!terrain.passable(t, vt)) t = route[j];
+      std::vector<Vector2> leg = terrain.findPath(from, t, vt, bias);
+      for (const Vector2& p : leg) {
+        u.path.push_back(p);
+        u.pathLeg.push_back(static_cast<int>(j));
+      }
+      if (!leg.empty()) from = leg.back();
+    }
+    u.formation = group;
+    u.assaultPoint = u.path.empty() ? o.dest : u.path.back();
+    if (u.path.empty()) u.mode = MoveMode::Hold;
   }
 }
 
@@ -956,10 +1292,8 @@ void Game::orderTarget(const std::vector<int>& ids, int enemy) {
 }
 
 void Game::orderStop(const std::vector<int>& ids) {
-  for (int id : ids) {
-    units[id].path.clear();
-    units[id].forcedTarget = -1;
-  }
+  for (int id : ids) units[id].forcedTarget = -1;
+  issueOrder(ids, {0, 0}, MoveMode::Hold, Formation::None);
 }
 
 void Game::toggleHoldFire(const std::vector<int>& ids) {

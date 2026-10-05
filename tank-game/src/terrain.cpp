@@ -271,23 +271,30 @@ bool Terrain::lineOfSight(Vector2 a, Vector2 b) const {
   return true;
 }
 
-bool Terrain::segmentClear(Vector2 a, Vector2 b, const VehicleType& vt, float minFactor) const {
+float Terrain::biasedFactor(const Tile& t, const VehicleType& vt, float roadBias) const {
+  float f = speedFactor(t, vt);
+  return (t.road || t.bridge) ? f * roadBias : f;
+}
+
+bool Terrain::segmentClear(Vector2 a, Vector2 b, const VehicleType& vt, float minFactor, float roadBias) const {
   float d = Vector2Distance(a, b);
   int n = std::max(1, static_cast<int>(d / 8.0f));
   for (int i = 0; i <= n; ++i) {
-    float f = speedFactorAt(Vector2Lerp(a, b, static_cast<float>(i) / n), vt);
+    Vector2 p = Vector2Lerp(a, b, static_cast<float>(i) / n);
+    if (p.x < 0 || p.y < 0 || p.x >= width() || p.y >= height()) return false;
+    float f = biasedFactor(atWorld(p), vt, roadBias);
     if (f <= 0.0f || f < minFactor) return false;
   }
   return true;
 }
 
-std::vector<Vector2> Terrain::findPath(Vector2 from, Vector2 to, const VehicleType& vt) const {
+std::vector<Vector2> Terrain::findPath(Vector2 from, Vector2 to, const VehicleType& vt, float roadBias) const {
   auto tileOf = [&](Vector2 p) {
     int tx = std::clamp(static_cast<int>(p.x / kTile), 0, kCols - 1);
     int ty = std::clamp(static_cast<int>(p.y / kTile), 0, kRows - 1);
     return ty * kCols + tx;
   };
-  auto factor = [&](int idx) { return speedFactor(tiles_[idx], vt); };
+  auto factor = [&](int idx) { return biasedFactor(tiles_[idx], vt, roadBias); };
 
   int start = tileOf(from), goal = tileOf(to);
   Vector2 finalPoint = to;
@@ -306,7 +313,7 @@ std::vector<Vector2> Terrain::findPath(Vector2 from, Vector2 to, const VehicleTy
     finalPoint = tileCenter(goal % kCols, goal / kCols);
   }
 
-  const float maxFactor = std::max(1.0f, vt.roadSpeed / vt.speed);
+  const float maxFactor = std::max(1.0f, vt.roadSpeed / vt.speed * std::max(1.0f, roadBias));
   auto heuristic = [&](int idx) {
     float dx = static_cast<float>(idx % kCols - goal % kCols);
     float dy = static_cast<float>(idx / kCols - goal / kCols);
@@ -368,7 +375,7 @@ std::vector<Vector2> Terrain::findPath(Vector2 from, Vector2 to, const VehicleTy
     float minF = std::min(factor(tiles[k]) > 0 ? factor(tiles[k]) : 10.0f, factor(tiles[k + 1]));
     for (size_t j = k + 1; j < n; ++j) {
       minF = std::min(minF, factor(tiles[j]));
-      if (segmentClear(anchor, pointAt(j), vt, minF * 0.999f)) best = j;
+      if (segmentClear(anchor, pointAt(j), vt, minF * 0.999f, roadBias)) best = j;
       else break;
     }
     anchor = pointAt(best);
